@@ -1,0 +1,520 @@
+---
+title: "Splines regression: a Bayesian approach"
+author: "Alvetreti Federico"
+date: "2023-07-12"
+output: 
+  rmdformats::readthedown:
+    theme: cerulean
+    highlight: espresso
+---
+
+```{r setup, include=FALSE}
+source('Final_hw_library.R')
+
+registerDoParallel(cores = (detectCores()-1))
+# Loading Data
+test <- fread("test.csv")
+train <- fread("train.csv")
+
+# Order data for plotting purposes
+train <- train[order(train$x),]
+test <- test[order(test$x),]
+
+# Load pre_done simulations
+load("simulations.Rdata")
+
+```
+
+## Introduction
+
+**Splines regression** is a flexible and powerful technique used in statistical modeling and data analysis. It provides a framework for fitting smooth curves to data, allowing for more flexible and realistic representations of complex relationships between variables.
+
+The fundamental idea behind splines regression is to divide the predictor variable range into smaller intervals, often referred to as knots or breakpoints. Within each interval, a polynomial function is fitted to the data, allowing for local adjustments and capturing the underlying structure more accurately. The polynomial functions are typically chosen to be of a low degree (e.g., linear or quadratic) to balance flexibility and complexity.
+
+One advantage of splines regression is its ability to control smoothness by imposing constraints on the continuity and differentiability of the fitted curve at the knot points. These constraints ensure that the resulting curve is continuous and differentiable up to a specified order, promoting a more interpretable and visually appealing representation.
+
+
+
+The data  we are going to use is the [WMAP data](https://map.gsfc.nasa.gov), reduced through a complicated procedure to the following scatterplot of power versus frequency:
+
+
+```{r first scatter plot, eval=T, echo=F}
+# Plotting Data
+plot(train$x,train$y,pch=20,xlab="Frequency",ylab="Power")
+
+```
+
+
+## EDA
+
+This dataset is pretty straightforward, anyway we can make a few considerations.
+
+
+### Outliers
+
+Firstly we can remove outliers to work on a less noisy data. 
+
+The algorithm I used identifies as outliers the points that are more then $3$ standard deviation from the moving mean, calculated on the previous $10$ points. The weight given to points identified as outliers in the moving mean computation is $0$.
+
+The assumption lurking behind this algorithm is that *previous close points has information on the subsequent*, or equally that our **target distribution is at least continuous**.
+Given this assumption we  can use this algorithm only if the predictor variable in our data is uniformly distributed in its domain. 
+
+Let's plot an histogram of the frequencies to check it:
+
+```{r uniform frequencies , eval=T, echo=F,fig.show="hold"}
+hist(train$x,xlab = "Frequency",ylab="",main = "Histogram of \"Frequency\" ")
+```
+
+The distribution is uniform, let's proceed with the algorithm.
+
+This is the result:
+
+```{r remove outliers , eval=T, echo=F}
+# parameters 
+lag = 10
+sd = 3
+weight = 0
+# Data removed outliers 
+new_train <- remove_outliers(train,lag,sd,weight)
+
+# Plotting new Data  
+plot(train$x,train$y,pch=20,xlab="Frequency",ylab="Power",col="red",ylim=c(-30000,30000),main = "Outliers detector algorithm ourput")
+
+outliers <- ThresholdingAlgo(train$y,lag,sd,weight)
+upper <- outliers$avgFilter + sd*outliers$stdFilter
+lower <- outliers$avgFilter - sd*outliers$stdFilter
+
+points(train$x,upper,"l",col="red",lwd=1)
+points(train$x,lower,"l",col="red",lwd=1)
+points(new_train$x,new_train$y,col="black",pch=20)
+
+# Legend
+legend("topleft",legend = c("new data","outliers"),col=c("black","red"),pch=c(20,20))
+
+plot(new_train$x,new_train$y,col="black",pch=20,xlab="Frequency",ylab="Power",main = "New data")
+
+```
+
+
+
+### Data heteroscedasticity 
+
+It's clear from a visualization point of view that we are dealing with a form of **heteroscedasticity**.
+
+To have an analytic proof we need to check the residuals of a fitting regression function, in this case a tenth degree polynomial.
+
+```{r  heteroscedasticity check, eval=T, echo=F}
+# Model 
+variance_model <- lm(new_train$y~ poly(new_train$x,10))
+
+# Plot model
+plot(new_train$x,new_train$y,pch=20,xlab="Frequency",ylab="Power",col="black",
+     main="10th degree fitted polynomial ")
+points(new_train$x,variance_model$fitted.values,"l",col="red",lwd=3)
+
+# Plot model residuals
+plot(new_train$x,(variance_model$residuals),pch=20,xlab = "Frequency", ylab="Model residuals",col="black",main="Residuals plot")
+lines(new_train$x,(variance_model$residuals),type="h",lwd=1,col="blue")
+points(new_train$x,(variance_model$residuals),pch=20,col="black")
+```
+
+The residuals are clearly increasing as the frequency rises.
+
+We will need to consider this while building our Bayesian model.
+
+## What are splines, really?
+A spline is a **piecewise polynomial function**.\
+Commonly a $D^{th}$**-order** spline has imposed to be *continuous* to the $(D-1)^{th}$**-order** derivative.\
+For the sake of remaining in a general framework, we will ignore this condition, creating spline continuous to our desire. 
+
+Given a set of $K$ points $ξ_1 < ξ_2 < · · · < ξ_K$, the *fastest* way to build a $D^{th}$-order spline continuous to the $C^{th}$ degree (with $0\leq C < D$), is  to start from **truncated power functions**:\
+
+$G_{D,K,C} = \{g_1(x),...,g_{D+1}(x), s_{(1,1)}(x),...,s_{(D-C,K)}(x)\}$\
+
+defined as: 
+
+$g_d(x):= f(x)^{(d-1)}$ with $d \in [1:D+1]$ \
+$s_{c,k}(x) := f(x-ξ_k)^c$ with $k \in [1:K]$ and  $c \in [1:(D-C)]$.
+
+To get more comfortable with splines here's the plot of a $C^0$ and $C^1$ **second degree splines regression** on our data fixed the knots at $[0.2,0.4,0.6,0.8]$: 
+
+```{r splines warmup, eval=T, echo=F}
+knots <- c(0.2,0.4,0.6,0.8)
+for(c in 0:1){
+  splines_model <- 
+    lm(new_train$y ~ as.matrix(splines_power_basis(new_train$x,Degree = 2,Knots = knots ,Continuity = c)))
+  plot(new_train$x,new_train$y,pch=20,xlab="Frequency",ylab="Power",col="black",lwd=0.5,
+       main = paste(paste("C",c,sep=""),"second degree spline"))
+  points(new_train$x,splines_model$fitted.values,"l",lwd=2,col="red")
+  abline(v = knots, col = "blue", lwd = 1, lty = 2)
+    legend("topleft",legend=c("Prediction","Knots positions"),col=c("red","blue"),lty=c(1,2))
+
+}
+```
+
+## Model breakdown
+
+The JAGS model we are gonna use is the following:
+
+```{r JAGS model ,eval=F, echo=TRUE}
+model {
+  # Likelihood
+  for (i in 1:N) {
+    y[i] ~ dnorm(mu[i], (x[i]<=0.5) + (-4*x[i]^2 + 4*x[i])^10*(x[i]>0.5))
+    for (d in (C + 1):D) {
+      for (k in 1:K) {
+        spline_features[i, (d - C - 1) * K + k] <- (((x[i] - knots[k])^d) * (x[i] > knots[k]))
+      }
+    }
+    mu[i] <- inprod(betas, c((x[i]^c(0:D)), spline_features[i, 1:(K * (D - C))]))
+  }
+  
+  # Priors for betas
+  for (j in 1:J) {
+    betas[j] ~ dnorm(0, 1.0E-4)
+  }
+  
+  # Priors for knots positions
+  for (k in 1:K) {
+    knots[k] ~ dunif(0, 1)
+  }
+}
+```
+
+Let's breakdown the model: 
+
+- Since it is a **regression problem** we assume that $y \sim N(\mu(x),\epsilon)$;
+- The betas priors are assumed to be *non-informative Gaussians* centered in $0$;
+- Since the knots can take values in $[0,1]$, and we want them to "freely" move across this interval, I set their priors to $dunif(0,1)$;
+- We've seen our data presents a case of **heteroscedasticity** hence we set the precision $\epsilon$ of our Gaussian to be dependent from the $x$ (frequency). The best way to treat this feature in our model would be to set an unknown parameter ( or many ), with an appropriate prior distribution, that the Bayesian framework would recover. Anyway, for convergence reasons that will be explained in the following chapter, I decided to adopt a more "handmade" solution.
+It seems that the precision of our model remains constant until around $0.5$, and then exponentially worst. To embed this feature of the data I decided to use the following precision function:
+
+```{r precision function, eval=T, echo=F}
+x <- seq(0,1,0.001)
+plot(x,(x<=0.5) + (-4*x^2 + 4*x)^10*(x>0.5),lwd=3,"l",xlab = "Frequency",ylab = "Precision",col="red")
+
+```
+
+The function that we will use to actually run the model is the following : 
+
+```{r JAGS function ,eval=F, echo=TRUE}
+JAGS_simulation <- function(Degree,Knots,Continuity,initial_knots,chains,iter,burnin,lag){
+  
+  # Number of betas
+  J <- (Degree-Continuity) * Knots + Degree + 1
+  
+  # Number of observations
+  N <- length(new_train$x)
+  
+  # Parameters to give to the JAGS model
+  data <- with(new_train, list(x = x, 
+                               y = y, 
+                               N = N,
+                               D = Degree,
+                               K = Knots,
+                               C = Continuity,
+                               J = J))
+  
+  # Initial values for knots positions and betas 
+  init_values <- function(){list(betas = rnorm(J,0,100),
+                                 knots = initial_knots)}
+  
+  # Parameters to keep track of during the MCMC
+  params <- c("knots","betas")
+  
+  # Actual simulation happens here
+  my_jags_fit <- jags(data = data, 
+                      inits = init_values, 
+                      parameters.to.save = params,
+                      model.file = "model.txt",
+                      n.chains = chains, 
+                      n.iter = iter, 
+                      n.burnin = burnin, 
+                      n.thin = lag)
+  
+  return(my_jags_fit)
+}
+```
+
+### Initial values thoughts
+
+The problem of choosing the best $K$ knots in a $D^{th}$ degree splines regression is **not trivial**.
+
+
+In my first attempts of running the previous model with multiple chains I kept obtaining **different results** (knots positions and betas) even though each chain showed **signs of convergence**.
+
+
+I figured out that this may indicate a phenomenon known as "chain swapping" or "chain crossing". 
+
+
+Chain swapping occurs when different chains explore different regions of the parameter space and encounter different modes of the target distribution. Even though each individual chain has converged within its explored region, the chains have not fully explored the entire parameter space collectively. 
+
+There are a few possible explanations for chain swapping:
+
+-**Multimodal distribution**: If the target distribution exhibits multiple modes or regions of high probability density, different chains may get trapped in different modes. Each chain may provide valid samples within its mode, but the combined set of samples from all chains may better represent the overall distribution.
+
+-**Initialization**: The initial starting values for each chain can influence the exploration of the parameter space. If the initial values are not well-distributed across the target distribution, chains may have a tendency to converge to different regions. Randomizing the initial values or using a more informed initialization strategy can help mitigate this issue.
+
+I understood one of the problems in my initial runs was the **poor initialization of knots**.
+
+I kept assuming the knots to be randomly distributed in the interval $[0,1]$, passing as *initial_knots* parameter for the *JAGS_simulation()* function a *runif(K, min = 0, max = 1)*.
+
+This type of non-informative initialization, which usually isn't evil at all, doesn't take account of the fact that **we have the data**, and we can visually see, and choose, what seems to be the best areas to check for a knot. 
+Considering we are fitting second degree polynomial between them, we must look for change in the convexity of the data.
+
+Given the previous considerations, here's a plot of what I believe are potential areas for containing knots:
+
+```{r knots initialization evaluation, eval=T, echo=F}
+plot(new_train$x,new_train$y,col="black",pch=20,xlab="Frequency",ylab="Power",main="Potential knots areas")
+polygon(x = c(0,0.13,0.13,0),y=c(-20000,-20000,20000,20000),col="blue",
+        density = 20)
+polygon(x = c(0.33,0.47,0.47,0.33),y=c(-20000,-20000,20000,20000),col="blue",
+        density = 20)
+polygon(x = c(0.55,0.7,0.7,0.55),y=c(-20000,-20000,20000,20000),col="blue",
+        density = 20)
+```
+
+Where the areas around $0,4$ and $0,6$ are more important, since the first part of the curve actually seems fittable by a parable.
+
+Given all the above considerations I decided to implement two **quadratic splines models**: one with $2$ knots, initialized in $[0.4,0.65]$, and another one with $3$ knots initialized in $[0.05,0.4,0.65]$. 
+
+## MCMC simulations, convergence and diagnostics
+Each MCMC simulation will consist of $3$ chains, each running for a total of $250000$ iterations. To account for burn-in, the first $50000$ iterations of each chain will be discarded. This burn-in period allows the chains to stabilize and reach the target distribution. A thinning factor of $400$ will be applied, retaining every $400$th iteration, resulting in a total of $500$ values per parameter.
+
+To assess the convergence of each parameter in each MCMC simulation I used traceplots, autocorrelation plots, and running means.
+
+**Traceplot**: The traceplot displays the sampled values of a parameter over the iterations of the MCMC simulation. Convergence is indicated by a traceplot that appears static, with the sampled values not exhibiting any significant trends or patterns. A static traceplot suggests that the Markov chain has reached its stationary distribution and is exploring the parameter space effectively.
+
+**Autocorrelation**: Autocorrelation measures the correlation between consecutive values in the MCMC chain, with different lags considered. Low autocorrelation between iterations indicates a faster convergence rate, as the current value of the parameter becomes less dependent on the previous values. A rapid decrease in autocorrelation suggests efficient mixing and convergence.
+
+**Running Means**: Running means provide a smoothed estimate of the parameter's value over iterations. Stable running means indicate convergence, as the means do not exhibit substantial fluctuations or trends. In contrast, erratic or unstable running means may suggest insufficient convergence or poor mixing of the Markov chain.
+
+Finally, before running the simulations, let's fix a seed of reproducibility:
+
+```{r seed ,eval=T, echo=TRUE}
+set.seed(112358)
+```
+
+### Two knots model
+
+
+**MCMC:**
+
+```{r two knots JAGS simulation,eval=F, echo=TRUE}
+two_knots_JAGS_model <- JAGS_simulation(Degree = 2,Knots = 2, Continuity = 1, initial_knots = c(0.4,0.65),chains = 3,iter = 250000, burnin = 50000, lag = 400)
+```
+
+```{r quadratic objects ,eval=T, include=F}
+two_knots_mcmc <- as.mcmc(two_knots_JAGS_model)
+two_knots_ggs <-  ggs(two_knots_mcmc)
+two_knots_chain <- two_knots_JAGS_model$BUGSoutput$sims.array
+```
+
+**Trace and density plot:**
+
+```{r quadratic trace/density plots, eval=TRUE, echo = FALSE,fig.height=15, fig.width=8}
+mcmc_combo(two_knots_chain)
+```
+
+
+**Autocorrelations:**
+
+```{r quadratic autocorrelations plots, eval=TRUE, echo = FALSE,fig.height=5, fig.width=8}
+acfplot(two_knots_mcmc)
+```
+
+**Running means:** 
+
+```{r quadratic running means plots, eval=TRUE, echo = FALSE,fig.height=10, fig.width=8}
+ggs_running(two_knots_ggs)
+
+```
+
+
+### Three knots model
+
+**MCMC:**
+
+```{r three knots JAGS simulation,eval=F, echo=TRUE}
+three_knots_JAGS_model <- JAGS_simulation(Degree = 2,Knots = 3, Continuity = 1, initial_knots =c(0.05,0.4,0.65),
+                                          chains = 3,iter = 250000, burnin = 50000, lag = 400)
+```
+
+```{r three knots objects ,eval=T, echo=F}
+three_knots_mcmc <- as.mcmc(three_knots_JAGS_model)
+three_knots_ggs = ggs(three_knots_mcmc)
+three_knots_chain <- three_knots_JAGS_model$BUGSoutput$sims.array
+```
+**Trace and density plots:**
+
+```{r three knots trace/density plots, eval=T, fig.height=15, fig.width=8,echo = FALSE}
+mcmc_combo(three_knots_chain)
+```
+
+**Autocorrelations:**
+
+```{r three knots autocorrelations plots, eval=T, echo = FALSE}
+acfplot(three_knots_mcmc)
+```
+
+**Running means:**
+
+```{r three knots running means plots, eval=T,fig.height=15, fig.width=8, echo = FALSE}
+ggs_running(three_knots_ggs)
+```
+
+
+
+### Convergence
+
+The two models behaves differently. 
+
+The first one behaves perfectly: extremely low autocorrelations, stable means and static traceplots.
+
+
+The second model has *more or less* stable means, static traceplots but, for the *knots[1],knots[2]* and *betas[3]* parameters, we have definitely high correlations.
+
+This mean the convergence is happening very slowly, even at the enormous numbers we set for the simulation. 
+
+This could mean that the model has poor mixing and/or that the number of iterations is not enough.
+
+**Infinite**, as a matter of fact, **is a really big number**.
+
+To numerically compare the level of convergence, we can calculate the effective sample size of each simulation:
+
+```{r effective sizes, eval=T, echo = T}
+effectiveSize(two_knots_mcmc)
+effectiveSize(three_knots_mcmc)
+```
+The first model has a mean of $1378.582$ effective sizes per parameter, while the three knots model it's at $818.9543$. This means that in general the two knots model has converged more. 
+
+The parameter with the lowest effective sample is *knot[1]* in the three knots model, as indicated also by the autocorrelation plot.
+
+
+We can now calculate the approximations errors of the two models, calculated as the empirical standard deviation considering the number of samples to be the effective sample size.
+
+Two knots model:
+
+```{r approximations error 1, eval=T, echo = F}
+format(sqrt(unlist(lapply(lapply(two_knots_JAGS_model$BUGSoutput$sims.list,var),diag))/effectiveSize(two_knots_mcmc)),scientific = F)
+```
+
+Three knots model: 
+
+```{r approximations error 2, eval=T, echo = F}
+format(sqrt(unlist(lapply(lapply(three_knots_JAGS_model$BUGSoutput$sims.list,var),diag))/effectiveSize(three_knots_mcmc)),scientific = F)
+```
+
+It's relieving to see that, despite high autocorrelations in the *three knots model*, we have **low approximation errors on all the retrieved parameters**.
+
+## Observations, predictions and models comparison
+
+The models behaves differently on the knots where they were equally initialized ($0.4,0.65$). 
+
+They found the same "far-right" knot, probably  due to the high variance that both the models are considering in the final part of the data.
+
+For the knot starting in $0.4$ the found different positions, probably due to the fact that the first model has no other knot in the previous interval. 
+
+We can show the Highest Posterior Density (HPD) intervals for comparison: 
+
+```{r HPD , eval=T, echo = T}
+my_HPD(two_knots_mcmc[,c("knots[1]","knots[2]")])
+my_HPD(three_knots_mcmc[,c("knots[1]","knots[2]","knots[3]")])
+```
+
+Here's the plot of the final knots positioning (obtained with the posterior median) of the different models with respect of the initial values: 
+
+```{r knots resume , eval=T,echo = F,fig.height=6}
+
+plot(c(0.4,0.65),c(0,0),pch=20,
+     ylim=c(-1,3.5),xlim=c(0,1),yaxt="n",ylab="",lwd=3,xlab="",xaxt="n")
+abline(h=c(0,2))
+
+segments(x0 = c(0.4,0.65),
+         y0 = rep(0,2),
+         x1 = two_knots_JAGS_model$BUGSoutput$median$knots,
+         y1 = rep(2,2),col="red",lwd=3,lty = 2)
+points(c(0.4,0.65),rep(0,2),pch=20,col="red",lwd=3)
+points(two_knots_JAGS_model$BUGSoutput$median$knots,rep(2,2),col="red",pch=20,lwd=3)
+
+segments(x0 = c(0.05,0.4,0.65),
+         y0 = rep(0,3),
+         x1 = three_knots_JAGS_model$BUGSoutput$median$knots,
+         y1 = rep(2,3),col="blue",lwd=3,lty=2)
+points(c(0.05,0.4,0.65),rep(0,3),pch=20,col="blue",lwd=3)
+points(three_knots_JAGS_model$BUGSoutput$median$knots,rep(2,3),col="blue",pch=20,lwd=3)
+
+legend("top",legend = c("two knots model","three knots model"),
+       col=c("red","blue"),lty = c(1,1))
+
+axis(1,pos=0)
+axis(1,pos=2)
+
+text(0.5,-0.8,"Initial knots position",cex = 1.2)
+text(0.5,2.5,"Final knots position",cex = 1.2)
+
+```
+
+Finally let's plot the prediction functions retrived by the models:
+
+```{r predictions plot , eval=T,echo = F}
+my_plot(two_knots_JAGS_model,D=2,C=1,K=2)
+my_plot(three_knots_JAGS_model,D=2,C=1,K=3)
+```
+
+Visually we can clearly see that the *three knots model* is performing better. 
+
+Let's check if this is also confirmed by **DIC** and **RMSE** on the test set:
+
+```{r models DIC , eval=T,echo = T}
+two_knots_JAGS_model$BUGSoutput$DIC
+three_knots_JAGS_model$BUGSoutput$DIC
+```
+The *three knots model* is confirmed the superior model also by the  Deviance Information Criterion (DIC), where it achieved the lowest value. 
+
+To further assess the performance of our models, I got back to an old Kaggle competition.
+I made two late submissions using our models and evaluated their performance based on the root mean squared error (RMSE), which was the competition's evaluation metric. In the frequentist framework, where we had to check manually a number of knots following a certain scheme, my group best submission achieved an RMSE score of $3024.87983$ , securing the fourth place. The winners submission obtained an RMSE score of $2916.39505$.
+
+Let's check our models score:
+
+```{r test predictions, eval=T,echo = F}
+two_knots_prediction <- my_predict(dataframe = test,model = two_knots_JAGS_model, degree = 2,knots = 2, continuity = 1)
+three_knots_prediction <- my_predict(dataframe = test,model = three_knots_JAGS_model, degree = 2,knots = 3, continuity = 1)
+
+write.csv(two_knots_prediction,"two_knots_prediction.csv",row.names = F)
+write.csv(three_knots_prediction,"three_knots_prediction.csv",row.names = F)
+```
+
+```{r predictions results, eval=T,echo = F}
+prediction_results <- matrix(data = NA,nrow=2,ncol=1)
+row.names(prediction_results) <- c("two knots model","three knots model")
+colnames(prediction_results) <- c("score")
+prediction_results[1,] <- c(2923.42036)
+prediction_results[2,] <- c(2899.90769)
+```
+
+```{r show predictions, eval=T,echo = F}
+prediction_results 
+```
+
+Here the *three knots model* confirms its superiority, also it would have let us win the Kaggle competition!
+
+## Conclusion
+
+### Summary
+
+In this homework report, we explored the concept of splines regression and its application in Bayesian modeling framework. We discussed the advantages of splines regression, such as its flexibility and ability to capture complex relationships between variables. 
+
+We implemented a JAGS (Just Another Gibbs Sampler) model for splines regression to estimate the parameters of the regression function. We used Markov Chain Monte Carlo (MCMC) simulations to obtain posterior distributions of the parameters and assessed the convergence of the chains through traceplots, autocorrelation plots, and running means.
+
+We compared two models: one with two knots and another with three knots. Through the analysis of traceplots, autocorrelation plots, and running means, we found that both models achieved convergence. However, the three knots model showed better performance in terms of prediction accuracy, as indicated by the DIC (Deviance Information Criterion) and RMSE (Root Mean Squared Error) on the test set.
+
+### Questions for Future Projects
+
+While this report provides a comprehensive analysis of splines regression, several questions remain for further investigation. These include:
+
+- How can we determine the optimal number of knots for a given dataset? In this report, we compared models with two and three knots, but there may be cases where a different number of knots could yield better results. Exploring techniques to automatically select the optimal number of knots could be an interesting topic for future projects.
+
+- How can we handle cases with a large number of knots or more complex spline structures? In this report, we limited the spline degree to the second order and considered a small number of knots. However, in practice, datasets may require more knots or higher-degree splines to capture intricate relationships. Exploring more advanced spline structures, such as B-splines or penalized splines, could be beneficial in such cases.
+
+- Can we extend the Bayesian model to incorporate uncertainty in the choice of the spline degree or continuity? In this report, we assumed fixed values for the degree and continuity of the splines. However, allowing for uncertainty in these parameters could lead to more flexible and robust models. Bayesian approaches that simultaneously estimate the spline structure and the model parameters could be a fun topic to explore.
